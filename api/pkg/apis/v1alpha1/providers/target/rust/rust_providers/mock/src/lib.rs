@@ -19,7 +19,7 @@ pub struct MockProvider;
 /// # Safety
 ///
 /// Client code must make sure that the provided pointer is valid.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn create_provider(config_json: *const c_char) -> *mut ProviderWrapper {
     if !config_json.is_null() {
         unsafe {

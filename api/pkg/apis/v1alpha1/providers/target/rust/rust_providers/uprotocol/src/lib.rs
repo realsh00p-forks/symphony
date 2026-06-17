@@ -435,7 +435,7 @@ impl UProtocolTargetProvider {
 /// # Safety
 ///
 /// Client code needs to make sure that the passed in pointer is valid.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn create_provider(config_json: *const c_char) -> *mut ProviderWrapper {
     // try to configure tracing to output Events to stdout
     if tracing_subscriber::fmt::try_init().is_err() {

@@ -133,7 +133,7 @@ pub struct ProviderWrapper {
 /// # Safety
 ///
 /// Client code needs to make sure that the provided pointers are valid.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn create_provider_instance(
     provider_path: *const c_char,
     expected_hash: *const c_char,
@@ -203,7 +203,7 @@ pub unsafe extern "C" fn create_provider_instance(
 /// # Safety
 ///
 /// Client code needs to make sure that the passed in handle is a valid (raw) pointer.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn destroy_provider_instance(handle: *mut ProviderHandle) {
     if !handle.is_null() {
         unsafe {
@@ -217,7 +217,7 @@ pub unsafe extern "C" fn destroy_provider_instance(handle: *mut ProviderHandle) 
 /// # Safety
 ///
 /// Client code needs to make sure that the passed in arguments are valid (raw) pointers.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn get_validation_rule(handle: *mut ProviderHandle) -> *mut c_char {
     let handle = unsafe { &*handle };
     match handle.provider.get_validation_rule() {
@@ -236,7 +236,7 @@ pub unsafe extern "C" fn get_validation_rule(handle: *mut ProviderHandle) -> *mu
 /// # Safety
 ///
 /// Client code needs to make sure that the passed in arguments are valid (raw) pointers.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn get(
     handle: *mut ProviderHandle,
     deployment_json: *const c_char,
@@ -264,7 +264,7 @@ pub unsafe extern "C" fn get(
 /// # Safety
 ///
 /// Client code needs to make sure that the passed in arguments are valid (raw) pointers.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn apply(
     handle: *mut ProviderHandle,
     deployment_json: *const c_char,
