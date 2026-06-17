@@ -71,6 +71,10 @@ pub trait ITargetProvider: Send + Sync {
         step: DeploymentStep,
         is_dry_run: bool,
     ) -> Result<HashMap<String, ComponentResultSpec>, String>;
+
+    fn commit(&self, _deployment: DeploymentSpec) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 /// A reference to the Target Provider instance that
@@ -286,6 +290,30 @@ pub unsafe extern "C" fn apply(
         Err(err) => {
             debug!("Error applying changes: {err}");
             ptr::null_mut()
+        }
+    }
+}
+
+/// Commits a successfully applied deployment.
+///
+/// # Safety
+///
+/// Client code needs to make sure that the passed in arguments are valid (raw) pointers.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn commit(
+    handle: *mut ProviderHandle,
+    deployment_json: *const c_char,
+) -> *mut c_char {
+    let handle = unsafe { &*handle };
+    let deployment_str = unsafe { CStr::from_ptr(deployment_json).to_str().unwrap() };
+    let deployment: DeploymentSpec = serde_json::from_str(deployment_str).unwrap();
+
+    match handle.provider.commit(deployment) {
+        Ok(()) => CString::new("{}").unwrap().into_raw(),
+        Err(err) => {
+            debug!("Error committing changes: {err}");
+            let json = serde_json::json!({ "error": err }).to_string();
+            CString::new(json).unwrap().into_raw()
         }
     }
 }

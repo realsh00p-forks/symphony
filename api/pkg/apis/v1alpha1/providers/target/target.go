@@ -22,3 +22,7 @@ type ITargetProvider interface {
 	// apply components to a target
 	Apply(ctx context.Context, deployment model.DeploymentSpec, step model.DeploymentStep, isDryRun bool) (map[string]model.ComponentResultSpec, error)
 }
+
+type ICommitTargetProvider interface {
+	Commit(ctx context.Context, deployment model.DeploymentSpec) error
+}

@@ -338,6 +338,7 @@ func (s *SolutionVersionManager) Reconcile(ctx context.Context, deployment model
 	someStepsRan := false
 
 	targetResult := make(map[string]int)
+	commitProviders := make(map[string]tgt.ICommitTargetProvider)
 
 	summary.PlannedDeployment = 0
 	for _, step := range plan.Steps {
@@ -489,6 +490,9 @@ func (s *SolutionVersionManager) Reconcile(ctx context.Context, deployment model
 			return summary, err
 		}
 		planSuccessCount++
+		if commitProvider, ok := provider.(tgt.ICommitTargetProvider); ok && !deployment.IsDryRun {
+			commitProviders[step.Target] = commitProvider
+		}
 		summary.CurrentDeployed += len(step.Components)
 		err = s.saveSummaryProgress(ctx, deployment.Instance.ObjectMeta.Name, summaryId, deployment.Generation, deployment.Hash, summary, namespace)
 		if err != nil {
@@ -509,6 +513,18 @@ func (s *SolutionVersionManager) Reconcile(ctx context.Context, deployment model
 			s.DeleteDeploymentState(ctx, deployment.Instance.ObjectMeta.Name, namespace)
 		} else {
 			s.UpsertDeploymentState(ctx, deployment.Instance.ObjectMeta.Name, namespace, deployment, mergedState)
+		}
+	}
+
+	if !deployment.IsDryRun {
+		for target, commitProvider := range commitProviders {
+			log.InfofCtx(ctx, " M (SolutionVersion): committing successful deployment on target %s", target)
+			err = commitProvider.Commit(ctx, dep)
+			if err != nil {
+				summary.SummaryMessage = "failed to commit target state: " + err.Error()
+				log.ErrorfCtx(ctx, " M (SolutionVersion): failed to commit target %s: %+v", target, err)
+				return summary, err
+			}
 		}
 	}
 

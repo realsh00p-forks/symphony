@@ -35,6 +35,9 @@ const char* get(ProviderHandle* handle, const char* deployment_json, const char*
 // Applies a deployment step to a target provider.
 const char* apply(ProviderHandle* handle, const char* deployment_json, const char* step_json, int is_dry_run);
 
+// Commits a successfully applied deployment on a target provider.
+const char* commit(ProviderHandle* handle, const char* deployment_json);
+
 #ifdef __cplusplus
 }
 #endif

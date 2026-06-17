@@ -223,6 +223,49 @@ func (r *RustTargetProvider) Apply(ctx context.Context, deployment model.Deploym
 	return result, nil
 }
 
+func (r *RustTargetProvider) Commit(ctx context.Context, deployment model.DeploymentSpec) error {
+	ctx, span := observability.StartSpan("Rust Target Provider", ctx, &map[string]string{
+		"method": "Commit",
+	})
+	var err error = nil
+	defer observ_utils.CloseSpanWithError(span, &err)
+	defer observ_utils.EmitUserDiagnosticsLogs(ctx, &err)
+
+	log.InfofCtx(ctx, "  P (Rust Target Provider): committing artifacts: %s - %s", deployment.Instance.Spec.Scope, deployment.Instance.ObjectMeta.Name)
+
+	deploymentJSON, err := json.Marshal(deployment)
+	if err != nil {
+		log.ErrorfCtx(ctx, "  P (Rust Target): failed to marshal deployment - %+v", err)
+		err = v1alpha2.NewCOAError(err, "failed to marshal deployment", v1alpha2.BadRequest)
+		return err
+	}
+
+	cDeploymentJSON := C.CString(string(deploymentJSON))
+	defer C.free(unsafe.Pointer(cDeploymentJSON))
+
+	cResult := C.commit(r.provider, cDeploymentJSON)
+	if cResult == nil {
+		log.ErrorfCtx(ctx, "  P (Rust Target): failed to commit deployment - %+v", err)
+		err = v1alpha2.NewCOAError(err, "failed to commit deployment", v1alpha2.ApplyResourceFailed)
+		return err
+	}
+	defer C.free(unsafe.Pointer(cResult))
+
+	var result map[string]string
+	if err := json.Unmarshal([]byte(C.GoString(cResult)), &result); err != nil {
+		log.ErrorfCtx(ctx, "  P (Rust Target): failed to unmarshal commit result - %+v", err)
+		err = v1alpha2.NewCOAError(err, "failed to unmarshal commit result", v1alpha2.ApplyResourceFailed)
+		return err
+	}
+	if message, ok := result["error"]; ok && message != "" {
+		log.ErrorfCtx(ctx, "  P (Rust Target): commit failed - %s", message)
+		err = v1alpha2.NewCOAError(fmt.Errorf("%s", message), "failed to commit deployment", v1alpha2.ApplyResourceFailed)
+		return err
+	}
+
+	return nil
+}
+
 func (r *RustTargetProvider) Close() {
 	if r.provider != nil {
 		C.destroy_provider_instance(r.provider)
