@@ -104,7 +104,10 @@ impl AnkaiosProvider {
             // drop the guard as soon as we have retrieved the state from Ankaios
             let mut ankaios_client = self.ank.lock().await;
             ankaios_client
-                .get_state(vec!["workloadStates".to_string(), "workloads".to_string()])
+                .get_state(vec![
+                    "workloadStates".to_string(),
+                    "desiredState.workloads".to_string(),
+                ])
                 .await
                 .map_err(|err| {
                     error!("Failed to retrieve component state from Ankaios: {err}");
