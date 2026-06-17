@@ -1,0 +1,1665 @@
+// Copyright (c) 2024 Elektrobit Automotive GmbH
+//
+// This program and the accompanying materials are made available under the
+// terms of the Apache License, Version 2.0 which is available at
+// https://www.apache.org/licenses/LICENSE-2.0.
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+// License for the specific language governing permissions and limitations
+// under the License.
+//
+// SPDX-License-Identifier: Apache-2.0
+
+//! This module contains the [`ControlInterface`] struct and the [`ControlInterfaceState`] enum.
+
+use prost::{Message, encoding::decode_varint};
+use std::{
+    collections::HashMap,
+    fs::metadata,
+    path::Path,
+    sync::{Arc, Mutex},
+};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt, BufReader, BufWriter, Error, ErrorKind},
+    net::unix::pipe,
+    spawn,
+    sync::mpsc,
+    task::JoinHandle,
+    time::{Duration, sleep, timeout as tokio_timeout},
+};
+
+use crate::components::event_types::EventEntry;
+use crate::components::log_types::{LogEntry, LogResponse};
+use crate::components::request::Request;
+use crate::components::response::{Response, ResponseType};
+use crate::components::workload_state_mod::WorkloadInstanceName;
+use crate::{AnkaiosError, ankaios_api};
+use ankaios_api::control_api::{FromAnkaios, Hello, ToAnkaios, to_ankaios::ToAnkaiosEnum};
+
+#[cfg(test)]
+use mockall::automock;
+
+/// Base path for the control interface FIFO pipes.
+const ANKAIOS_CONTROL_INTERFACE_BASE_PATH: &str = "/run/ankaios/control_interface";
+/// Input fifo path from the base path
+const ANKAIOS_INPUT_FIFO_PATH: &str = "input";
+/// Output fifo path from the base path
+const ANKAIOS_OUTPUT_FIFO_PATH: &str = "output";
+/// Version of [Ankaios](https://eclipse-ankaios.github.io/ankaios) that is compatible
+/// with the [`ControlInterface`] implementation.
+const ANKAIOS_VERSION: &str = "1.0.0";
+/// Maximum size of a varint in bytes.
+const MAX_VARINT_SIZE: usize = 19;
+
+/// Enum representing the state of the control interface.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[repr(i32)]
+pub enum ControlInterfaceState {
+    /// The control interface was initialized.
+    Initialized = 1,
+    /// The control interface is established.
+    Connected = 2,
+    /// The control interface is terminated.
+    Terminated = 3,
+    /// The agent is disconnected.
+    AgentDisconnected = 4,
+    /// The connection is closed. This state is unrecoverable.
+    ConnectionClosed = 5,
+}
+
+#[doc(hidden)]
+#[derive(Debug, Clone)]
+struct SynchronizedSenderMap<T> {
+    /// A map of request IDs to their corresponding senders.
+    senders_map: Arc<Mutex<HashMap<String, mpsc::Sender<T>>>>,
+}
+
+impl<T> SynchronizedSenderMap<T> {
+    /// Inserts a new sender for a request ID part of a started campaign.
+    ///
+    /// ## Arguments
+    ///
+    /// * `request_id` - A [String] representing the request ID;
+    /// * `sender` - A [`mpsc::Sender<T>`] to forward campaign messages.
+    ///
+    fn insert(&mut self, request_id: String, sender: mpsc::Sender<T>) {
+        self.senders_map
+            .lock()
+            .unwrap_or_else(|_| unreachable!())
+            .insert(request_id, sender);
+    }
+
+    /// Removes a sender by its request ID.
+    ///
+    /// ## Arguments
+    ///
+    /// * `request_id` - A [String] representing the request ID.
+    ///
+    /// ## Returns
+    ///
+    /// An [`Option<mpsc::Sender<T>>`] if the request ID was found and removed, otherwise `None`.
+    fn remove(&mut self, request_id: &str) -> Option<mpsc::Sender<T>> {
+        self.senders_map
+            .lock()
+            .unwrap_or_else(|_| unreachable!())
+            .remove(request_id)
+    }
+
+    /// Gets a cloned sender by its request ID.
+    ///
+    /// ## Arguments
+    ///
+    /// * `request_id` - A [String] representing the request ID.
+    ///
+    /// ## Returns
+    ///
+    /// An [`Option<mpsc::Sender<T>>`] if the request ID was found, otherwise `None`.
+    fn get_cloned(&self, request_id: &str) -> Option<mpsc::Sender<T>> {
+        self.senders_map
+            .lock()
+            .unwrap_or_else(|_| unreachable!())
+            .get(request_id)
+            .cloned()
+    }
+}
+
+impl<T> Default for SynchronizedSenderMap<T> {
+    fn default() -> Self {
+        SynchronizedSenderMap {
+            senders_map: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+}
+
+/// This struct handles the interaction with the control interface.
+/// It provides means to send and receive messages through the FIFO pipes.
+///
+/// It uses two [tokio] tasks, one for reading from the input FIFO and one for
+/// writing to the output FIFO.
+pub struct ControlInterface {
+    /// Path to the FIFO pipes directory.
+    pub(crate) path: String,
+    /// Output file for writing to the control interface.
+    output_file: Option<pipe::Sender>,
+    /// Handler for the read thread.
+    read_thread_handler: Option<JoinHandle<Result<(), AnkaiosError>>>,
+    /// Handler for the write thread.
+    writer_thread_handler: Option<JoinHandle<Result<(), AnkaiosError>>>,
+    /// State of the control interface.
+    state: Arc<Mutex<ControlInterfaceState>>,
+    /// Sender for the response channel.
+    response_sender: mpsc::Sender<Response>,
+    /// Sender for the writer channel.
+    writer_ch_sender: Option<mpsc::Sender<ToAnkaios>>,
+    /// Request ID to logs sender mapping
+    log_senders_map: SynchronizedSenderMap<LogResponse>,
+    /// Request ID to events sender mapping
+    events_senders_map: SynchronizedSenderMap<EventEntry>,
+}
+
+/// Helper function that reads varint data from the input pipe.
+///
+/// ## Arguments
+///
+/// * `file` - A mutable reference to the input file.
+///
+/// ## Returns
+///
+/// A result containing the varint data as a byte array or an [Error].
+async fn read_varint_data(
+    file: &mut BufReader<pipe::Receiver>,
+) -> Result<[u8; MAX_VARINT_SIZE], Error> {
+    let mut res = [0u8; MAX_VARINT_SIZE];
+    for item in &mut res {
+        *item = file.read_u8().await?;
+        if *item & 0b1000_0000 == 0 {
+            break;
+        }
+    }
+    Ok(res)
+}
+
+/// Helper function that reads protobuf data from the input pipe.
+///
+/// ## Arguments
+///
+/// * `file` - A mutable reference to the input file.
+///
+/// ## Returns
+///
+/// A result containing the protobuf data as a byte array or an [Error].
+async fn read_protobuf_data(file: &mut BufReader<pipe::Receiver>) -> Result<Vec<u8>, Error> {
+    let varint_data = read_varint_data(file).await?;
+    let mut boxed_varint_data = Box::new(&varint_data[..]);
+
+    let size = usize::try_from(decode_varint(&mut boxed_varint_data)?)
+        .map_err(|_| Error::new(ErrorKind::InvalidData, "Invalid varint size"))?;
+
+    let mut buf = vec![0; size];
+    file.read_exact(&mut buf).await?;
+    Ok(buf)
+}
+
+#[cfg_attr(test, automock)]
+impl ControlInterface {
+    /// Creates a new instance of the control interface.
+    ///
+    /// ## Arguments
+    ///
+    /// * `response_sender` - A sender for the response channel.
+    ///
+    /// ## Returns
+    ///
+    /// A new [`ControlInterface`] instance.
+    pub fn new(response_sender: mpsc::Sender<Response>) -> Self {
+        Self {
+            path: ANKAIOS_CONTROL_INTERFACE_BASE_PATH.to_owned(),
+            output_file: None,
+            read_thread_handler: None,
+            writer_thread_handler: None,
+            state: Arc::new(Mutex::new(ControlInterfaceState::Terminated)),
+            response_sender,
+            writer_ch_sender: None,
+            log_senders_map: SynchronizedSenderMap::default(),
+            events_senders_map: SynchronizedSenderMap::default(),
+        }
+    }
+
+    /// Connects to the control interface.
+    ///
+    /// ## Returns
+    ///
+    /// An [`AnkaiosError`]::[`ControlInterfaceError`](AnkaiosError::ControlInterfaceError) if the connection fails.
+    pub async fn connect(&mut self, timeout: Duration) -> Result<(), AnkaiosError> {
+        if matches!(
+            *self.state.lock().unwrap_or_else(|_| unreachable!()),
+            ControlInterfaceState::Initialized | ControlInterfaceState::Connected
+        ) {
+            return Err(AnkaiosError::ControlInterfaceError(
+                "Already connected.".to_owned(),
+            ));
+        }
+        if metadata(&(self.path.clone() + "/" + ANKAIOS_INPUT_FIFO_PATH)).is_err() {
+            return Err(AnkaiosError::ControlInterfaceError(
+                "Control interface input fifo does not exist.".to_owned(),
+            ));
+        }
+        if metadata(&(self.path.clone() + "/" + ANKAIOS_OUTPUT_FIFO_PATH)).is_err() {
+            return Err(AnkaiosError::ControlInterfaceError(
+                "Control interface output fifo does not exist.".to_owned(),
+            ));
+        }
+
+        self.prepare_writer();
+        self.read_from_control_interface();
+        ControlInterface::change_state(&self.state, ControlInterfaceState::Initialized);
+        ControlInterface::send_initial_hello(
+            self.writer_ch_sender
+                .as_ref()
+                .unwrap_or_else(|| unreachable!()),
+        )
+        .await;
+
+        // Wait for the connection to be established
+        let state_clone = Arc::<Mutex<ControlInterfaceState>>::clone(&self.state);
+        if (tokio_timeout(timeout, async {
+            while *state_clone.lock().unwrap_or_else(|_| unreachable!())
+                != ControlInterfaceState::Connected
+            {
+                sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await)
+            .is_err()
+        {
+            log::error!("Connection to the control interface timed out.");
+            return Err(AnkaiosError::ControlInterfaceError(
+                "Connection to the control interface timed out.".to_owned(),
+            ));
+        }
+
+        log::trace!("Connected to the control interface.");
+        Ok(())
+    }
+
+    /// Disconnects from the control interface.
+    ///
+    /// ## Returns
+    ///
+    /// An [`AnkaiosError`]::[`ControlInterfaceError`](AnkaiosError::ControlInterfaceError) if the disconnection fails.
+    pub fn disconnect(&mut self) -> Result<(), AnkaiosError> {
+        if !matches!(
+            *self.state.lock().unwrap_or_else(|_| unreachable!()),
+            ControlInterfaceState::Initialized | ControlInterfaceState::Connected
+        ) {
+            return Err(AnkaiosError::ControlInterfaceError(
+                "Already disconnected.".to_owned(),
+            ));
+        }
+        if let Some(handler) = self.read_thread_handler.take() {
+            handler.abort();
+        }
+        self.state
+            .lock()
+            .unwrap_or_else(|_| unreachable!())
+            .clone_from(&ControlInterfaceState::Terminated);
+        self.output_file = None;
+        Ok(())
+    }
+
+    /// Changes the state of the control interface.
+    /// This method should be used for all state changes inside the control interface.
+    ///
+    /// ## Arguments
+    ///
+    /// * `state` - A reference to the current state;
+    /// * `new_state` - The new state to be set.
+    fn change_state(state: &Arc<Mutex<ControlInterfaceState>>, new_state: ControlInterfaceState) {
+        if *state.lock().unwrap_or_else(|_| unreachable!()) == new_state {
+            return;
+        }
+        state
+            .lock()
+            .unwrap_or_else(|_| unreachable!())
+            .clone_from(&new_state);
+        log::info!("State changed: {new_state:?}");
+    }
+
+    /// Prepares the writer thread for the control interface.
+    /// It uses a [tokio] task that waits for messages and sends them to the output FIFO.
+    fn prepare_writer(&mut self) {
+        let (writer_ch_sender, mut writer_ch_receiver) = mpsc::channel::<ToAnkaios>(5);
+        self.writer_ch_sender = Some(writer_ch_sender.clone());
+        let output_path = Path::new(&self.path)
+            .to_path_buf()
+            .join(ANKAIOS_OUTPUT_FIFO_PATH);
+        let state_clone = Arc::<Mutex<ControlInterfaceState>>::clone(&self.state);
+        self.writer_thread_handler = Some(spawn(async move {
+            const AGENT_RECONNECT_INTERVAL: u64 = 1;
+            let sender = pipe::OpenOptions::new()
+                .open_sender(output_path)
+                .map_err(|_| {
+                    AnkaiosError::ControlInterfaceError("Could not open output fifo.".to_owned())
+                })?;
+            let mut output_file = BufWriter::new(sender);
+
+            while let Some(message) = writer_ch_receiver.recv().await {
+                output_file
+                    .write_all(&message.encode_length_delimited_to_vec())
+                    .await
+                    .unwrap_or_else(|err| {
+                        log::error!("Error while writing to output fifo: '{err}'");
+                        // let _ = self.disconnect();
+                    });
+                #[allow(clippy::else_if_without_else)]
+                if let Err(err) = output_file.flush().await {
+                    if err.kind() == ErrorKind::BrokenPipe {
+                        if *state_clone.lock().unwrap_or_else(|_| unreachable!())
+                            == ControlInterfaceState::Connected
+                        {
+                            ControlInterface::change_state(
+                                &state_clone,
+                                ControlInterfaceState::AgentDisconnected,
+                            );
+                        }
+                        log::warn!("Waiting for the agent..");
+                        sleep(Duration::from_secs(AGENT_RECONNECT_INTERVAL)).await;
+                        ControlInterface::send_initial_hello(&writer_ch_sender).await;
+                    } else {
+                        log::error!("Error while flushing to output fifo: '{err}'");
+                        // let _ = self.disconnect();
+                    }
+                } else if *state_clone.lock().unwrap_or_else(|_| unreachable!())
+                    == ControlInterfaceState::AgentDisconnected
+                {
+                    ControlInterface::change_state(
+                        &state_clone,
+                        ControlInterfaceState::Initialized,
+                    );
+                }
+            }
+            Ok(())
+        }));
+    }
+
+    /// Prepares the reader thread for the control interface.
+    /// It uses a [tokio] task that reads continuously from the FIFO input pipe.
+    fn read_from_control_interface(&mut self) {
+        #[cfg(not(test))]
+        const SLEEP_DURATION: u64 = 500; // ms
+        #[cfg(test)]
+        const SLEEP_DURATION: u64 = 50; // ms
+        let input_path = Path::new(&self.path)
+            .to_path_buf()
+            .join(ANKAIOS_INPUT_FIFO_PATH);
+        let response_sender_clone = self.response_sender.clone();
+        let writer_ch_sender_clone = self
+            .writer_ch_sender
+            .as_ref()
+            .unwrap_or_else(|| unreachable!())
+            .clone();
+        let state_clone = Arc::<Mutex<ControlInterfaceState>>::clone(&self.state);
+        let mut logs_sender_shared_map = self.log_senders_map.clone();
+        let mut event_sender_shared_map = self.events_senders_map.clone();
+        self.read_thread_handler = Some(spawn(async move {
+            let receiver = pipe::OpenOptions::new()
+                .open_receiver(input_path)
+                .map_err(|_| {
+                    AnkaiosError::ControlInterfaceError("Could not open input fifo.".to_owned())
+                })?;
+            let mut input_file = BufReader::new(receiver);
+
+            loop {
+                match read_protobuf_data(&mut input_file).await {
+                    Ok(binary) => {
+                        if *state_clone.lock().unwrap_or_else(|_| unreachable!())
+                            == ControlInterfaceState::AgentDisconnected
+                        {
+                            log::info!("Agent reconnected successfully.");
+                            Self::change_state(&state_clone, ControlInterfaceState::Initialized);
+                        }
+
+                        let decoded_response = FromAnkaios::decode(&mut Box::new(binary.as_ref()));
+
+                        match decoded_response {
+                            Ok(from_ankaios) => {
+                                let received_response = Response::new(from_ankaios);
+                                let con_closed_reason: Option<String> =
+                                    match &received_response.content {
+                                        ResponseType::ConnectionClosedReason(reason) => {
+                                            Some(reason.clone())
+                                        }
+                                        _ => None,
+                                    };
+
+                                Self::handle_decoded_response(
+                                    &state_clone,
+                                    received_response,
+                                    &response_sender_clone,
+                                    &mut logs_sender_shared_map,
+                                    &mut event_sender_shared_map,
+                                )
+                                .await;
+
+                                if let Some(reason) = con_closed_reason {
+                                    log::error!("Connection closed by the agent. Reason {reason}.");
+                                    Self::change_state(
+                                        &state_clone,
+                                        ControlInterfaceState::ConnectionClosed,
+                                    );
+                                    break;
+                                }
+                            }
+                            Err(err) => log::error!("Invalid response, parsing error: '{err}'"),
+                        }
+                    }
+                    Err(err) if err.kind() == ErrorKind::UnexpectedEof => {
+                        if *state_clone.lock().unwrap_or_else(|_| unreachable!())
+                            == ControlInterfaceState::Connected
+                        {
+                            Self::change_state(
+                                &state_clone,
+                                ControlInterfaceState::AgentDisconnected,
+                            );
+                            Self::send_initial_hello(&writer_ch_sender_clone).await;
+                        }
+                        sleep(Duration::from_millis(SLEEP_DURATION)).await;
+                    }
+                    Err(err) => {
+                        log::error!("Error while reading from input fifo: '{err}'");
+                        Self::change_state(&state_clone, ControlInterfaceState::Terminated);
+                        break;
+                    }
+                }
+            }
+
+            Ok(())
+        }));
+    }
+
+    #[doc(hidden)]
+    /// Handles the decoded response from the control interface and dispatches to the appropriate action.
+    ///
+    /// ## Arguments
+    ///
+    /// * `state` - A reference to the current state;
+    /// * `received_response` - A decoded [`Response`] object from the control interface;
+    /// * `response_sender` - A [`Sender<Response>`] to forward the response;
+    /// * `logs_sender_map` - A [`SynchronizedSenderMap<LogResponse>`] to forward log entries and stop responses for a log campaign;
+    /// * `event_sender_map` - A [`SynchronizedSenderMap<EventEntry>`] to forward events for an event campaign
+    ///
+    async fn handle_decoded_response(
+        state: &Arc<Mutex<ControlInterfaceState>>,
+        received_response: Response,
+        response_sender: &mpsc::Sender<Response>,
+        logs_sender_map: &mut SynchronizedSenderMap<LogResponse>,
+        event_sender_map: &mut SynchronizedSenderMap<EventEntry>,
+    ) {
+        // The state needs to be locked outside of the match because otherwise the temporary created guard
+        // will be dropped only at the end, repetitive locking inside the match not being allowed.
+        let state_value = *state.lock().unwrap_or_else(|_| unreachable!());
+        match state_value {
+            ControlInterfaceState::Initialized => {
+                if received_response.content == ResponseType::ControlInterfaceAccepted {
+                    log::debug!("Received control interface accepted response.");
+                    ControlInterface::change_state(state, ControlInterfaceState::Connected);
+                }
+            }
+            ControlInterfaceState::Connected => match received_response.content {
+                ResponseType::LogEntriesResponse(log_entries) => {
+                    Self::forward_log_entries(received_response.id, log_entries, logs_sender_map)
+                        .await;
+                }
+                ResponseType::LogsStopResponse(instance_name) => {
+                    Self::forward_logs_stop_response(
+                        received_response.id,
+                        instance_name,
+                        logs_sender_map,
+                    )
+                    .await;
+                }
+                ResponseType::EventResponse(event_entry) => {
+                    Self::forward_event_response(
+                        received_response.id,
+                        event_entry,
+                        event_sender_map,
+                    )
+                    .await;
+                }
+                ResponseType::ControlInterfaceAccepted => {
+                    log::warn!("Received unexpected control interface accepted response.");
+                }
+                _ => {
+                    response_sender
+                        .send(received_response)
+                        .await
+                        .unwrap_or_else(|err| {
+                            log::error!("Error while sending response: '{err}'");
+                        });
+                }
+            },
+            _ => {
+                log::warn!(
+                    "Received response {received_response:?}, but not in a valid state. Ignoring.."
+                );
+            }
+        }
+    }
+
+    /// Writes a request to the control interface.
+    ///
+    /// ## Arguments
+    ///
+    /// * `request` - A [`Request`] object to be sent.
+    ///
+    /// ## Returns
+    ///
+    /// An [`AnkaiosError`]::[`ControlInterfaceError`](AnkaiosError::ControlInterfaceError) if not connected.
+    pub async fn write_request<T: Request + 'static>(
+        &mut self,
+        request: T,
+    ) -> Result<(), AnkaiosError> {
+        if *self.state.lock().unwrap_or_else(|_| unreachable!()) != ControlInterfaceState::Connected
+        {
+            log::error!("Could not write to pipe, not connected.");
+            return Err(AnkaiosError::ControlInterfaceError(
+                "Could not write to pipe, not connected.".to_owned(),
+            ));
+        }
+        let message = ToAnkaios {
+            to_ankaios_enum: Some(ToAnkaiosEnum::Request(request.to_proto())),
+        };
+        if let Some(sender) = self.writer_ch_sender.as_ref() {
+            sender.send(message).await.unwrap_or_else(|err| {
+                log::error!("Error while sending request: '{err}'");
+            });
+        }
+        Ok(())
+    }
+
+    #[doc(hidden)]
+    /// Adds a log campaign to the control interface.
+    ///
+    /// ## Arguments
+    ///
+    /// * `request_id` - A [String] representing the request ID of the initial logs request of the log campaign;
+    /// * `logs_sender` - A [`mpsc::Sender<LogResponse>`] to forward log responses for the log campaign.
+    ///
+    pub fn add_log_campaign(&mut self, request_id: String, logs_sender: mpsc::Sender<LogResponse>) {
+        log::trace!("Add log campaign with request id: '{request_id}'");
+
+        self.log_senders_map.insert(request_id, logs_sender);
+    }
+
+    #[doc(hidden)]
+    /// Removes a log campaign from the control interface.
+    ///
+    /// ## Arguments
+    ///
+    /// * `request_id` - A [&str] representing the request ID of the initial logs request of the log campaign;
+    ///
+    pub fn remove_log_campaign(&mut self, request_id: &str) {
+        if self.log_senders_map.remove(request_id).is_some() {
+            log::trace!("Removed log campaign with request id: '{request_id}'");
+        }
+    }
+
+    #[doc(hidden)]
+    /// Adds an events campaign to the control interface.
+    ///
+    /// ## Arguments
+    ///
+    /// * `request_id` - A [String] representing the request ID of the initial events campaign;
+    /// * `events_sender` - A [`mpsc::Sender<EventEntry>`] to forward events for the campaign.
+    ///
+    pub fn add_events_campaign(
+        &mut self,
+        request_id: String,
+        events_sender: mpsc::Sender<EventEntry>,
+    ) {
+        log::trace!("Add event campaign with request id: '{request_id}'");
+
+        self.events_senders_map.insert(request_id, events_sender);
+    }
+
+    #[doc(hidden)]
+    /// Removes an events campaign from the control interface.
+    ///
+    /// ## Arguments
+    ///
+    /// * `request_id` - A [&str] representing the request ID of the initial events request.;
+    ///
+    pub fn remove_events_campaign(&mut self, request_id: &str) {
+        if self.events_senders_map.remove(request_id).is_some() {
+            log::trace!("Removed events campaign with request id: '{request_id}'");
+        }
+    }
+
+    #[doc(hidden)]
+    /// Forwards the log entries to the appropriate log campaign receiver.
+    ///
+    /// ## Arguments
+    ///
+    /// * `request_id` - A [String] representing the request ID of the initial logs request of the log campaign;
+    /// * `log_entries` - A [`Vec<LogEntry>`] containing the log entries of workload to be forwarded;
+    /// * `logs_sender_map` - A [`SynchronizedSenderMap<LogResponse>`] to forward log entries and stop responses for a log campaign.
+    ///
+    async fn forward_log_entries(
+        request_id: String,
+        log_entries: Vec<LogEntry>,
+        logs_sender_map: &SynchronizedSenderMap<LogResponse>,
+    ) {
+        let log_entries_sender = logs_sender_map.get_cloned(&request_id);
+
+        if let Some(sender) = log_entries_sender {
+            log::trace!(
+                "Forwarding log entries for request id '{request_id}' to log campaign receiver."
+            );
+            sender
+                .send(LogResponse::LogEntries(log_entries))
+                .await
+                .unwrap_or_else(|err| {
+                    log::error!("Error while sending log entries: '{err}'");
+                });
+        } else {
+            log::debug!(
+                "Received log entries response for request id '{request_id}', but no log campaign found."
+            );
+        }
+    }
+
+    #[doc(hidden)]
+    /// Forwards the logs stop response for a workload instance to the appropriate log campaign receiver.
+    ///
+    /// ## Arguments
+    ///
+    /// * `request_id` - A [String] representing the request ID of the initial logs request of the log campaign;
+    /// * `instance_name` - A [`WorkloadInstanceName`] for which the logs stop response is sent;
+    /// * `logs_sender_map` - A [`SynchronizedSenderMap<LogResponse>`] to forward log entries and stop responses for a log campaign.
+    ///
+    async fn forward_logs_stop_response(
+        request_id: String,
+        instance_name: WorkloadInstanceName,
+        logs_sender_map: &mut SynchronizedSenderMap<LogResponse>,
+    ) {
+        let log_entries_sender = logs_sender_map.get_cloned(&request_id);
+        if let Some(sender) = log_entries_sender {
+            log::trace!(
+                "Forwarding logs stop response for workload '{instance_name:?}' of request id '{request_id}' to log campaign receiver."
+            );
+            sender
+                .send(LogResponse::LogsStopResponse(instance_name))
+                .await
+                .unwrap_or_else(|err| {
+                    log::error!("Error while sending log stop message: '{err}'");
+                });
+        } else {
+            log::debug!(
+                "Received logs stop response for request id '{request_id}', but no log campaign found."
+            );
+        }
+    }
+
+    #[doc(hidden)]
+    /// Forwards the event entries to the appropriate receiver.
+    ///
+    /// ## Arguments
+    ///
+    /// * `request_id` - A [String] representing the request ID of the initial event request of the events campaign;
+    /// * `event_entry` - A [`EventEntry`] representing the event to be forwarded;
+    /// * `event_sender_map` - A [`SynchronizedSenderMap<EventEntry>`] to forward an event for an event campaign.
+    ///
+    async fn forward_event_response(
+        request_id: String,
+        event_entry: Box<EventEntry>,
+        event_sender_map: &SynchronizedSenderMap<EventEntry>,
+    ) {
+        let event_sender = event_sender_map.get_cloned(&request_id);
+
+        if let Some(sender) = event_sender {
+            log::trace!("Forwarding event entry for request id '{request_id}' to receiver.");
+            sender.send(*event_entry).await.unwrap_or_else(|err| {
+                log::error!("Error while sending event entry: '{err}'");
+            });
+        } else {
+            log::debug!(
+                "Received event entry for request id '{request_id}', but no event campaign found."
+            );
+        }
+    }
+
+    /// Prepares and sends a hello to the [Ankaios](https://eclipse-ankaios.github.io/ankaios) cluster.
+    ///
+    /// ## Arguments
+    ///
+    /// * `writer_ch_sender` - A sender for the writer channel.
+    async fn send_initial_hello(writer_ch_sender: &mpsc::Sender<ToAnkaios>) {
+        log::trace!("Sending initial hello message to the control interface.");
+        let hello_msg = ToAnkaios {
+            to_ankaios_enum: Some(ToAnkaiosEnum::Hello(Hello {
+                protocol_version: ANKAIOS_VERSION.to_owned(),
+            })),
+        };
+        writer_ch_sender
+            .send(hello_msg)
+            .await
+            .unwrap_or_else(|err| {
+                log::error!("Error while sending initial hello message: '{err}'");
+            });
+    }
+}
+
+//////////////////////////////////////////////////////////////////////////////
+//                 ########  #######    #########  #########                //
+//                    ##     ##        ##             ##                    //
+//                    ##     #####     #########      ##                    //
+//                    ##     ##                ##     ##                    //
+//                    ##     #######   #########      ##                    //
+//////////////////////////////////////////////////////////////////////////////
+
+#[cfg(test)]
+mod tests {
+    use nix::{sys::stat::Mode, unistd::mkfifo};
+    use prost::Message;
+    use std::{
+        sync::{Arc, Mutex},
+        time::Duration,
+    };
+    use tokio::{
+        fs::OpenOptions,
+        io::{AsyncWriteExt, BufReader, BufWriter},
+        net::unix::pipe,
+        spawn,
+        sync::{Barrier, mpsc},
+        time::{sleep, timeout as tokio_timeout},
+    };
+
+    use super::{
+        ANKAIOS_INPUT_FIFO_PATH, ANKAIOS_OUTPUT_FIFO_PATH, ANKAIOS_VERSION, ControlInterface,
+        ControlInterfaceState, read_protobuf_data,
+    };
+    use crate::{
+        AnkaiosError, EventEntry, LogResponse,
+        ankaios::CHANNEL_SIZE,
+        ankaios_api,
+        components::{
+            request::{Request, generate_test_request},
+            response::{
+                Response, ResponseType, generate_test_control_interface_accepted_response,
+                generate_test_logs_stop_response, generate_test_proto_log_entries_response,
+                generate_test_proto_update_state_success, generate_test_response_event_entry,
+                generate_test_response_update_state_success,
+                get_test_proto_from_ankaios_log_entries_response,
+            },
+            workload_state_mod::WorkloadInstanceName,
+        },
+    };
+    use ankaios_api::control_api::{Hello, ToAnkaios, to_ankaios::ToAnkaiosEnum};
+
+    const CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
+
+    /// Helper function for getting the state of the control interface.
+    fn get_state(ci: &ControlInterface) -> ControlInterfaceState {
+        let state = ci.state.lock().unwrap();
+        *state
+    }
+
+    const REQUEST_ID_1: &str = "request_id_1";
+    const REQUEST_ID_2: &str = "request_id_2";
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn utest_read_protobuf_data() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let fifo = tmpdir.path().join("fifo");
+        mkfifo(&fifo, Mode::S_IRWXU).unwrap();
+
+        let barrier1 = Arc::new(Barrier::new(2));
+        let barrier2 = Arc::<Barrier>::clone(&barrier1);
+        let fifo_clone = fifo.clone();
+        let jh = spawn(async move {
+            let mut file = tokio::io::BufReader::new(
+                pipe::OpenOptions::new().open_receiver(&fifo_clone).unwrap(),
+            );
+            barrier1.wait().await;
+            let data = read_protobuf_data(&mut file).await.unwrap();
+            assert_eq!(data, vec![17]);
+        });
+
+        barrier2.wait().await; // Wait for the reader to start
+
+        let mut f = pipe::OpenOptions::new().open_sender(&fifo).unwrap();
+        let v = vec![1, 17];
+        f.write_all(&v).await.unwrap();
+        f.flush().await.unwrap();
+
+        jh.await.unwrap();
+    }
+
+    #[test]
+    fn utest_control_interface_state() {
+        let mut cis = ControlInterfaceState::Initialized;
+        assert_eq!(format!("{cis:?}"), "Initialized");
+        cis = ControlInterfaceState::Connected;
+        assert_eq!(format!("{cis:?}"), "Connected");
+        cis = ControlInterfaceState::Terminated;
+        assert_eq!(format!("{cis:?}"), "Terminated");
+        cis = ControlInterfaceState::AgentDisconnected;
+        assert_eq!(format!("{cis:?}"), "AgentDisconnected");
+        cis = ControlInterfaceState::ConnectionClosed;
+        assert_eq!(format!("{cis:?}"), "ConnectionClosed");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn utest_control_interface_connect() {
+        // Crate mpsc channel
+        let (response_sender, _response_receiver) = mpsc::channel::<Response>(CHANNEL_SIZE);
+
+        // Prepare fifo pipes
+        let tmpdir = tempfile::tempdir().unwrap();
+        let fifo_input = tmpdir.path().join(ANKAIOS_INPUT_FIFO_PATH);
+        let fifo_output = tmpdir.path().join(ANKAIOS_OUTPUT_FIFO_PATH);
+
+        // Create control interface
+        let mut ci = ControlInterface::new(response_sender);
+        tmpdir.path().to_str().unwrap().clone_into(&mut ci.path);
+        assert_eq!(get_state(&ci), ControlInterfaceState::Terminated);
+
+        // Try to connect - should fail because the input fifo is not yet created
+        assert!(ci.connect(CONNECT_TIMEOUT).await.is_err());
+        mkfifo(&fifo_input, Mode::S_IRWXU).unwrap();
+
+        // Try to connect - should fail because the output fifo is not yet created
+        assert!(ci.connect(CONNECT_TIMEOUT).await.is_err());
+        mkfifo(&fifo_output, Mode::S_IRWXU).unwrap();
+
+        // Open the output file for reading
+        let mut file_output = tokio::io::BufReader::new(
+            pipe::OpenOptions::new()
+                .open_receiver(&fifo_output)
+                .unwrap(),
+        );
+
+        // Create task to simulate the established connection
+        let state_clone = Arc::<Mutex<ControlInterfaceState>>::clone(&ci.state);
+        let _handle = spawn(async move {
+            loop {
+                if *state_clone.lock().unwrap_or_else(|_| unreachable!())
+                    == ControlInterfaceState::Initialized
+                {
+                    *state_clone.lock().unwrap_or_else(|_| unreachable!()) =
+                        ControlInterfaceState::Connected;
+                    break;
+                }
+                sleep(Duration::from_millis(50)).await;
+            }
+        });
+
+        // Connect to the control interface - success
+        ci.connect(CONNECT_TIMEOUT).await.unwrap();
+        assert_eq!(get_state(&ci), ControlInterfaceState::Connected);
+
+        // Check that the initial hello was received
+        #[allow(clippy::match_wild_err_arm)]
+        match tokio_timeout(Duration::from_secs(1), read_protobuf_data(&mut file_output)).await {
+            Ok(Ok(binary)) => {
+                let to_ankaios = ToAnkaios::decode(&mut Box::new(binary.as_ref())).unwrap();
+                assert_eq!(
+                    to_ankaios.to_ankaios_enum,
+                    Some(ToAnkaiosEnum::Hello(Hello {
+                        protocol_version: ANKAIOS_VERSION.to_owned(),
+                    }))
+                );
+            }
+            Err(_) => panic!("Hello message was not sent"),
+            _ => panic!("Error while reading pipe"),
+        }
+
+        // Try to connect again - should fail because it's already connected
+        assert!(ci.connect(CONNECT_TIMEOUT).await.is_err());
+
+        sleep(Duration::from_millis(50)).await;
+
+        // Disconnect from the control interface
+        ci.disconnect().unwrap();
+        assert_eq!(get_state(&ci), ControlInterfaceState::Terminated);
+
+        // Try to disconnect again - should fail
+        assert!(ci.disconnect().is_err());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn utest_control_interface_connect_timeout() {
+        // Crate mpsc channel
+        let (response_sender, _response_receiver) = mpsc::channel::<Response>(CHANNEL_SIZE);
+
+        // Prepare fifo pipes
+        let tmpdir = tempfile::tempdir().unwrap();
+        let fifo_input = tmpdir.path().join(ANKAIOS_INPUT_FIFO_PATH);
+        let fifo_output = tmpdir.path().join(ANKAIOS_OUTPUT_FIFO_PATH);
+
+        // Create control interface
+        let mut ci = ControlInterface::new(response_sender);
+        tmpdir.path().to_str().unwrap().clone_into(&mut ci.path);
+        assert_eq!(get_state(&ci), ControlInterfaceState::Terminated);
+
+        // Create the input and output fifo pipes
+        mkfifo(&fifo_input, Mode::S_IRWXU).unwrap();
+        mkfifo(&fifo_output, Mode::S_IRWXU).unwrap();
+
+        // Try to connect to the control interface
+        let ret = ci.connect(Duration::from_millis(20)).await;
+        assert!(matches!(
+            ret,
+            Err(AnkaiosError::ControlInterfaceError(ref msg)) if msg == "Connection to the control interface timed out."
+        ));
+
+        // Disconnect to close the pipes
+        assert!(ci.disconnect().is_ok());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn utest_control_interface_send_request() {
+        // Crate mpsc channel
+        let (response_sender, mut response_receiver) = mpsc::channel::<Response>(CHANNEL_SIZE);
+
+        // Prepare fifo pipes
+        let tmpdir = tempfile::tempdir().unwrap();
+        let fifo_input = tmpdir.path().join(ANKAIOS_INPUT_FIFO_PATH);
+        let fifo_output = tmpdir.path().join(ANKAIOS_OUTPUT_FIFO_PATH);
+
+        // Open fifo pipes
+        mkfifo(&fifo_input, Mode::S_IRWXU).unwrap();
+        mkfifo(&fifo_output, Mode::S_IRWXU).unwrap();
+
+        // Open the output file for reading
+        let mut file_output = tokio::io::BufReader::new(
+            pipe::OpenOptions::new()
+                .open_receiver(&fifo_output)
+                .unwrap(),
+        );
+
+        // Create control interface
+        let mut ci = ControlInterface::new(response_sender);
+        tmpdir.path().to_str().unwrap().clone_into(&mut ci.path);
+        assert_eq!(get_state(&ci), ControlInterfaceState::Terminated);
+
+        // Send dummy request - should fail
+        assert!(ci.write_request(generate_test_request()).await.is_err());
+
+        // Create task to simulate the established connection
+        let state_clone = Arc::<Mutex<ControlInterfaceState>>::clone(&ci.state);
+        let _handle = spawn(async move {
+            loop {
+                if *state_clone.lock().unwrap_or_else(|_| unreachable!())
+                    == ControlInterfaceState::Initialized
+                {
+                    *state_clone.lock().unwrap_or_else(|_| unreachable!()) =
+                        ControlInterfaceState::Connected;
+                    break;
+                }
+                sleep(Duration::from_millis(50)).await;
+            }
+        });
+
+        // Connect to the control interface
+        ci.connect(CONNECT_TIMEOUT).await.unwrap();
+        assert_eq!(get_state(&ci), ControlInterfaceState::Connected);
+        ci.state
+            .lock()
+            .unwrap_or_else(|_| unreachable!())
+            .clone_from(&ControlInterfaceState::Connected);
+
+        // Read the initial hello message
+        let _ = tokio_timeout(Duration::from_secs(1), read_protobuf_data(&mut file_output))
+            .await
+            .unwrap();
+
+        // Create sender to the input pipe
+        sleep(Duration::from_millis(20)).await; // the receiver should be available first
+        let mut file_input =
+            BufWriter::new(pipe::OpenOptions::new().open_sender(&fifo_input).unwrap());
+
+        // Generate and send request
+        let req = generate_test_request();
+        let req_proto = req.to_proto();
+        let req_id = req.get_id();
+        ci.write_request(req).await.unwrap();
+
+        // Check that the request was sent
+        #[allow(clippy::match_wild_err_arm)]
+        match tokio_timeout(Duration::from_secs(1), read_protobuf_data(&mut file_output)).await {
+            Ok(Ok(binary)) => {
+                let to_ankaios = ToAnkaios::decode(&mut Box::new(binary.as_ref())).unwrap();
+                assert_eq!(
+                    to_ankaios.to_ankaios_enum,
+                    Some(ToAnkaiosEnum::Request(req_proto))
+                );
+            }
+            Err(_) => panic!("Request was not sent"),
+            _ => panic!("Error while reading pipe"),
+        }
+
+        // Send response
+        let response = generate_test_proto_update_state_success(req_id.clone());
+        file_input
+            .write_all(&response.encode_length_delimited_to_vec())
+            .await
+            .unwrap();
+        file_input.flush().await.unwrap();
+
+        // Check that the response was received
+        let received_response = response_receiver.recv().await.unwrap();
+        assert_eq!(received_response.id, req_id.clone());
+        assert_eq!(
+            received_response.content,
+            generate_test_response_update_state_success(req_id.clone()).content
+        );
+
+        // Disconnect from the control interface
+        ci.disconnect().unwrap();
+        assert_eq!(get_state(&ci), ControlInterfaceState::Terminated);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn utest_control_interface_agent_disconnected() {
+        // Crate mpsc channel
+        let (response_sender, _) = mpsc::channel::<Response>(CHANNEL_SIZE);
+
+        // Prepare fifo pipes
+        let tmpdir = tempfile::tempdir().unwrap();
+        let fifo_input = tmpdir.path().join(ANKAIOS_INPUT_FIFO_PATH);
+        let fifo_input_clone = fifo_input.clone();
+        let fifo_output = tmpdir.path().join(ANKAIOS_OUTPUT_FIFO_PATH);
+
+        // Open fifo pipes
+        mkfifo(&fifo_input, Mode::S_IRWXU).unwrap();
+        mkfifo(&fifo_output, Mode::S_IRWXU).unwrap();
+        let barrier = Arc::new(Barrier::new(2));
+
+        // Open the output file for reading
+        let file_output = BufReader::new(
+            pipe::OpenOptions::new()
+                .open_receiver(&fifo_output)
+                .unwrap(),
+        );
+
+        // Spawn a writer task for the input file
+        let writer_barrier = Arc::<Barrier>::clone(&barrier);
+        tokio::spawn(async move {
+            let writer = OpenOptions::new()
+                .write(true)
+                .open(fifo_input)
+                .await
+                .unwrap();
+
+            writer_barrier.wait().await;
+            drop(writer); // Closing the writer, EOF will be triggered in the reader
+        });
+
+        // Create control interface
+        let mut ci = ControlInterface::new(response_sender);
+        tmpdir.path().to_str().unwrap().clone_into(&mut ci.path);
+        assert_eq!(get_state(&ci), ControlInterfaceState::Terminated);
+        sleep(Duration::from_millis(10)).await;
+
+        // Create task to simulate the established connection
+        let state_clone = Arc::<Mutex<ControlInterfaceState>>::clone(&ci.state);
+        let _handle = spawn(async move {
+            loop {
+                if *state_clone.lock().unwrap_or_else(|_| unreachable!())
+                    == ControlInterfaceState::Initialized
+                {
+                    *state_clone.lock().unwrap_or_else(|_| unreachable!()) =
+                        ControlInterfaceState::Connected;
+                    break;
+                }
+                sleep(Duration::from_millis(50)).await;
+            }
+        });
+
+        // Connect to the control interface
+        ci.connect(CONNECT_TIMEOUT).await.unwrap();
+        assert_eq!(get_state(&ci), ControlInterfaceState::Connected);
+        ci.state
+            .lock()
+            .unwrap_or_else(|_| unreachable!())
+            .clone_from(&ControlInterfaceState::Connected);
+
+        // Wait to ensure the reader gets to open the input pipe
+        sleep(Duration::from_millis(20)).await;
+        drop(file_output);
+        barrier.wait().await;
+
+        // Wait for the state to change
+        sleep(Duration::from_millis(20)).await;
+        assert_eq!(get_state(&ci), ControlInterfaceState::AgentDisconnected);
+
+        // Recreate the output file for reading
+        let _file_output = tokio::io::BufReader::new(
+            pipe::OpenOptions::new()
+                .open_receiver(&fifo_output)
+                .unwrap(),
+        );
+
+        // Reconnect the input pipe
+        let barrier_open = Arc::new(Barrier::new(2));
+        let barrier_open_clone = Arc::<Barrier>::clone(&barrier_open);
+        let barrier_close = Arc::new(Barrier::new(2));
+        let barrier_close_clone = Arc::<Barrier>::clone(&barrier_close);
+        tokio::spawn(async move {
+            let writer = tokio::fs::OpenOptions::new()
+                .write(true)
+                .open(fifo_input_clone)
+                .await
+                .unwrap();
+
+            barrier_open_clone.wait().await;
+            // Wait for the state to change to initialized
+            barrier_close_clone.wait().await;
+            drop(writer);
+        });
+        // Wait for the writer to open the input pipe
+        barrier_open.wait().await;
+
+        // wait for the state to change
+        tokio_timeout(Duration::from_secs(2), async {
+            loop {
+                if get_state(&ci) == ControlInterfaceState::Initialized {
+                    break;
+                }
+                sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("State is not initialized as it's supposed to be.");
+        barrier_close.wait().await;
+
+        // Disconnect from the control interface
+        ci.disconnect().unwrap();
+        assert_eq!(get_state(&ci), ControlInterfaceState::Terminated);
+    }
+
+    #[tokio::test]
+    async fn utest_handle_decoded_response() {
+        // Crate mpsc channel
+        let (response_sender, mut response_receiver) = mpsc::channel::<Response>(CHANNEL_SIZE);
+
+        // Create control interface
+        let mut ci = ControlInterface::new(response_sender);
+        let state = Arc::clone(&ci.state);
+
+        // Create responses to test the method
+        let ci_accepted_response = generate_test_control_interface_accepted_response();
+        let update_state_response =
+            generate_test_response_update_state_success(REQUEST_ID_1.to_owned());
+
+        // Test invalid state
+        *state.lock().unwrap() = ControlInterfaceState::Terminated;
+        ControlInterface::handle_decoded_response(
+            &state,
+            update_state_response.clone(),
+            &ci.response_sender,
+            &mut ci.log_senders_map,
+            &mut ci.events_senders_map,
+        )
+        .await;
+        response_receiver.try_recv().unwrap_err(); // No response should be sent
+
+        // Test initialized state - received control interface accepted response
+        *state.lock().unwrap() = ControlInterfaceState::Initialized;
+        ControlInterface::handle_decoded_response(
+            &state,
+            ci_accepted_response.clone(),
+            &ci.response_sender,
+            &mut ci.log_senders_map,
+            &mut ci.events_senders_map,
+        )
+        .await;
+        assert!(matches!(get_state(&ci), ControlInterfaceState::Connected));
+
+        // Test connected state - received unexpected control interface accepted response
+        ControlInterface::handle_decoded_response(
+            &state,
+            ci_accepted_response,
+            &ci.response_sender,
+            &mut ci.log_senders_map,
+            &mut ci.events_senders_map,
+        )
+        .await;
+
+        // Test connected state - received valid response
+        response_receiver.try_recv().unwrap_err(); // No response should be sent
+        ControlInterface::handle_decoded_response(
+            &state,
+            update_state_response,
+            &ci.response_sender,
+            &mut ci.log_senders_map,
+            &mut ci.events_senders_map,
+        )
+        .await;
+        assert!(matches!(
+            response_receiver.recv().await.unwrap().get_content(),
+            ResponseType::UpdateStateSuccess(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn utest_control_interface_receive_log_entries() {
+        // Crate mpsc channel
+        let (response_sender, _response_receiver) = mpsc::channel::<Response>(CHANNEL_SIZE);
+
+        // Prepare fifo pipes
+        let tmpdir = tempfile::tempdir().unwrap();
+        let fifo_input = tmpdir.path().join(ANKAIOS_INPUT_FIFO_PATH);
+        let fifo_output = tmpdir.path().join(ANKAIOS_OUTPUT_FIFO_PATH);
+
+        mkfifo(&fifo_input, Mode::S_IRWXU).unwrap();
+        mkfifo(&fifo_output, Mode::S_IRWXU).unwrap();
+
+        // Create control interface
+        let mut ci = ControlInterface::new(response_sender);
+        tmpdir.path().to_str().unwrap().clone_into(&mut ci.path);
+        let (logs_sender, mut logs_receiver) = mpsc::channel::<LogResponse>(CHANNEL_SIZE);
+        ci.log_senders_map
+            .insert(REQUEST_ID_1.to_owned(), logs_sender);
+
+        // Simulate connecting to the control interface
+        ci.prepare_writer();
+        ci.read_from_control_interface();
+        ci.state
+            .lock()
+            .unwrap_or_else(|_| unreachable!())
+            .clone_from(&ControlInterfaceState::Connected);
+
+        sleep(Duration::from_millis(20)).await; // the receiver should be available first
+        let mut file_input =
+            BufWriter::new(pipe::OpenOptions::new().open_sender(&fifo_input).unwrap());
+
+        // Create a test log entries response
+        let log_entries_response = generate_test_proto_log_entries_response();
+        let to_ankaios = get_test_proto_from_ankaios_log_entries_response(
+            REQUEST_ID_1.to_owned(),
+            log_entries_response.clone(),
+        );
+
+        // Mock sending a message from Ankaios
+        file_input
+            .write_all(&to_ankaios.encode_length_delimited_to_vec())
+            .await
+            .unwrap();
+        file_input.flush().await.unwrap();
+
+        let result = tokio::time::timeout(Duration::from_millis(100), logs_receiver.recv()).await;
+        assert!(result.is_ok());
+        let response = result.unwrap();
+        assert!(response.is_some());
+
+        let log_response = response.unwrap();
+        let expected_log_entries = LogResponse::LogEntries(
+            log_entries_response
+                .log_entries
+                .into_iter()
+                .map(std::convert::Into::into)
+                .collect(),
+        );
+
+        assert_eq!(log_response, expected_log_entries);
+
+        // Disconnect from the control interface
+        ci.remove_log_campaign(REQUEST_ID_1);
+        ci.disconnect().unwrap();
+        assert_eq!(get_state(&ci), ControlInterfaceState::Terminated);
+    }
+
+    #[tokio::test]
+    async fn utest_control_interface_forward_log_entries_response_unable_to_find_log_campaign() {
+        // Crate mpsc channel
+        let (response_sender, mut response_receiver) = mpsc::channel::<Response>(CHANNEL_SIZE);
+
+        // Create control interface
+        let mut ci = ControlInterface::new(response_sender);
+
+        let (logs_sender, mut logs_receiver) = mpsc::channel::<LogResponse>(CHANNEL_SIZE);
+        ci.log_senders_map
+            .insert(REQUEST_ID_1.to_owned(), logs_sender);
+
+        assert!(
+            ci.log_senders_map
+                .senders_map
+                .lock()
+                .unwrap()
+                .get(REQUEST_ID_2)
+                .is_none()
+        );
+
+        let not_existing_log_request_id = REQUEST_ID_2.to_owned();
+        ControlInterface::forward_log_entries(
+            not_existing_log_request_id,
+            Vec::default(),
+            &ci.log_senders_map,
+        )
+        .await;
+
+        sleep(Duration::from_millis(50)).await;
+
+        let result = logs_receiver.try_recv();
+        assert!(result.is_err());
+
+        let result = response_receiver.try_recv();
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn utest_control_interface_receive_logs_stop_response() {
+        let _ = env_logger::builder().is_test(true).try_init();
+        // Crate mpsc channel
+        let (response_sender, _response_receiver) = mpsc::channel::<Response>(CHANNEL_SIZE);
+
+        // Create control interface
+        let mut ci = ControlInterface::new(response_sender);
+        let state = ci.state;
+        *state.lock().unwrap() = ControlInterfaceState::Connected;
+
+        let (logs_sender, mut logs_receiver) = mpsc::channel::<LogResponse>(CHANNEL_SIZE);
+        ci.log_senders_map
+            .insert(REQUEST_ID_1.to_owned(), logs_sender);
+
+        let instance_name_1 = WorkloadInstanceName::new(
+            "agent_A".to_owned(),
+            "workload_A".to_owned(),
+            "id_a".to_owned(),
+        );
+
+        let instance_name_2 = WorkloadInstanceName::new(
+            "agent_B".to_owned(),
+            "workload_B".to_owned(),
+            "id_b".to_owned(),
+        );
+
+        let response =
+            generate_test_logs_stop_response(REQUEST_ID_1.to_owned(), instance_name_1.clone());
+
+        ControlInterface::handle_decoded_response(
+            &state,
+            response,
+            &ci.response_sender,
+            &mut ci.log_senders_map,
+            &mut ci.events_senders_map,
+        )
+        .await;
+
+        let result = tokio::time::timeout(Duration::from_millis(100), logs_receiver.recv()).await;
+        assert!(result.is_ok());
+        let response = result.unwrap();
+        assert!(response.is_some());
+
+        let log_response = response.unwrap();
+        assert_eq!(log_response, LogResponse::LogsStopResponse(instance_name_1));
+
+        let response =
+            generate_test_logs_stop_response(REQUEST_ID_1.to_owned(), instance_name_2.clone());
+
+        ControlInterface::handle_decoded_response(
+            &state,
+            response,
+            &ci.response_sender,
+            &mut ci.log_senders_map,
+            &mut ci.events_senders_map,
+        )
+        .await;
+
+        let result = tokio::time::timeout(Duration::from_millis(100), logs_receiver.recv()).await;
+        assert!(result.is_ok());
+        let response = result.unwrap();
+        assert!(response.is_some());
+
+        let log_response = response.unwrap();
+        assert_eq!(log_response, LogResponse::LogsStopResponse(instance_name_2));
+
+        assert!(!ci.log_senders_map.senders_map.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn utest_control_interface_forward_logs_stop_response_unable_to_find_log_campaign() {
+        // Crate mpsc channel
+        let (response_sender, mut response_receiver) = mpsc::channel::<Response>(CHANNEL_SIZE);
+
+        // Create control interface
+        let mut ci = ControlInterface::new(response_sender);
+
+        let (logs_sender, mut logs_receiver) = mpsc::channel::<LogResponse>(CHANNEL_SIZE);
+        ci.log_senders_map
+            .insert(REQUEST_ID_1.to_owned(), logs_sender);
+
+        assert!(
+            ci.log_senders_map
+                .senders_map
+                .lock()
+                .unwrap()
+                .get(REQUEST_ID_2)
+                .is_none()
+        );
+
+        assert_eq!(ci.log_senders_map.senders_map.lock().unwrap().len(), 1);
+
+        let not_existing_log_request_id = REQUEST_ID_2.to_owned();
+        ControlInterface::forward_logs_stop_response(
+            not_existing_log_request_id,
+            WorkloadInstanceName::new(
+                "agent_A".to_owned(),
+                "workload_A".to_owned(),
+                "id_a".to_owned(),
+            ),
+            &mut ci.log_senders_map,
+        )
+        .await;
+
+        sleep(Duration::from_millis(50)).await;
+
+        let result = logs_receiver.try_recv();
+        assert!(result.is_err());
+
+        let result = response_receiver.try_recv();
+        assert!(result.is_err());
+
+        // no remove happened, so len shall be the same as before
+        assert_eq!(ci.log_senders_map.senders_map.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn utest_control_interface_receive_event_entry() {
+        let _ = env_logger::builder().is_test(true).try_init();
+        // Crate mpsc channel
+        let (response_sender, _response_receiver) = mpsc::channel::<Response>(CHANNEL_SIZE);
+
+        // Create control interface
+        let mut ci = ControlInterface::new(response_sender);
+        let state = ci.state;
+        *state.lock().unwrap() = ControlInterfaceState::Connected;
+
+        let (events_sender, mut events_receiver) = mpsc::channel::<EventEntry>(CHANNEL_SIZE);
+        ci.events_senders_map
+            .insert(REQUEST_ID_1.to_owned(), events_sender);
+
+        // Create a test event entry response with the same request ID
+        let event_entry_response = generate_test_response_event_entry(REQUEST_ID_1.to_owned());
+
+        // Handle event entry response
+        ControlInterface::handle_decoded_response(
+            &state,
+            event_entry_response,
+            &ci.response_sender,
+            &mut ci.log_senders_map,
+            &mut ci.events_senders_map,
+        )
+        .await;
+
+        let result = tokio::time::timeout(Duration::from_millis(100), events_receiver.recv()).await;
+
+        assert!(result.is_ok());
+        let response = result.unwrap();
+        assert!(response.is_some());
+
+        let event_entry = response.unwrap();
+
+        assert_eq!(
+            event_entry.added_fields,
+            vec![
+                "desiredState.configs.config2".to_owned(),
+                "desiredState.configs.config3".to_owned(),
+            ]
+        );
+        assert_eq!(
+            event_entry.updated_fields,
+            vec!["desiredState.configs.config1".to_owned()]
+        );
+        assert_eq!(
+            event_entry.removed_fields,
+            vec!["desiredState.configs.config4".to_owned()]
+        );
+
+        // Create a test event entry response with another request ID
+        let event_entry_response = generate_test_response_event_entry(REQUEST_ID_2.to_owned());
+
+        // Handle event entry response
+        ControlInterface::handle_decoded_response(
+            &state,
+            event_entry_response,
+            &ci.response_sender,
+            &mut ci.log_senders_map,
+            &mut ci.events_senders_map,
+        )
+        .await;
+
+        let result = tokio::time::timeout(Duration::from_millis(100), events_receiver.recv()).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn utest_control_interface_add_log_campaign() {
+        let (response_sender, _) = mpsc::channel::<Response>(CHANNEL_SIZE);
+        let mut ci = ControlInterface::new(response_sender);
+
+        let (logs_sender_1, _) = mpsc::channel::<LogResponse>(CHANNEL_SIZE);
+        ci.add_log_campaign(REQUEST_ID_1.to_owned(), logs_sender_1);
+
+        {
+            let map_guard = ci.log_senders_map.senders_map.lock().unwrap();
+            assert_eq!(map_guard.len(), 1);
+            assert!(map_guard.get(REQUEST_ID_1).is_some());
+        }
+
+        let (logs_sender_2, _) = mpsc::channel::<LogResponse>(CHANNEL_SIZE);
+        ci.add_log_campaign(REQUEST_ID_2.to_owned(), logs_sender_2);
+
+        {
+            let map_guard = ci.log_senders_map.senders_map.lock().unwrap();
+            assert_eq!(map_guard.len(), 2);
+            assert!(map_guard.get(REQUEST_ID_2).is_some());
+        }
+    }
+
+    #[tokio::test]
+    async fn utest_control_interface_remove_log_campaign() {
+        let (response_sender, _) = mpsc::channel::<Response>(CHANNEL_SIZE);
+        let mut ci = ControlInterface::new(response_sender);
+
+        let (logs_sender_1, _) = mpsc::channel::<LogResponse>(CHANNEL_SIZE);
+        ci.log_senders_map
+            .senders_map
+            .lock()
+            .unwrap()
+            .insert(REQUEST_ID_1.to_owned(), logs_sender_1);
+
+        let (logs_sender_2, _) = mpsc::channel::<LogResponse>(CHANNEL_SIZE);
+        ci.log_senders_map
+            .senders_map
+            .lock()
+            .unwrap()
+            .insert(REQUEST_ID_2.to_owned(), logs_sender_2);
+
+        assert_eq!(ci.log_senders_map.senders_map.lock().unwrap().len(), 2);
+
+        ci.remove_log_campaign(REQUEST_ID_1);
+
+        {
+            let map_guard = ci.log_senders_map.senders_map.lock().unwrap();
+            assert_eq!(map_guard.len(), 1);
+            assert!(map_guard.get(REQUEST_ID_1).is_none());
+            assert!(map_guard.get(REQUEST_ID_2).is_some());
+        }
+
+        ci.remove_log_campaign(REQUEST_ID_2);
+
+        {
+            let map_guard = ci.log_senders_map.senders_map.lock().unwrap();
+            assert_eq!(map_guard.len(), 0);
+            assert!(map_guard.get(REQUEST_ID_2).is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn utest_control_interface_add_events_campaign() {
+        let (response_sender, _) = mpsc::channel::<Response>(CHANNEL_SIZE);
+        let mut ci = ControlInterface::new(response_sender);
+
+        let (events_sender_1, _) = mpsc::channel::<EventEntry>(CHANNEL_SIZE);
+        ci.add_events_campaign(REQUEST_ID_1.to_owned(), events_sender_1);
+
+        {
+            let map_guard = ci.events_senders_map.senders_map.lock().unwrap();
+            assert_eq!(map_guard.len(), 1);
+            assert!(map_guard.get(REQUEST_ID_1).is_some());
+        }
+
+        let (events_sender_2, _) = mpsc::channel::<EventEntry>(CHANNEL_SIZE);
+        ci.add_events_campaign(REQUEST_ID_2.to_owned(), events_sender_2);
+
+        {
+            let map_guard = ci.events_senders_map.senders_map.lock().unwrap();
+            assert_eq!(map_guard.len(), 2);
+            assert!(map_guard.get(REQUEST_ID_2).is_some());
+        }
+    }
+
+    #[tokio::test]
+    async fn utest_control_interface_remove_events_campaign() {
+        let (response_sender, _) = mpsc::channel::<Response>(CHANNEL_SIZE);
+        let mut ci = ControlInterface::new(response_sender);
+
+        let (events_sender_1, _) = mpsc::channel::<EventEntry>(CHANNEL_SIZE);
+        ci.events_senders_map
+            .senders_map
+            .lock()
+            .unwrap()
+            .insert(REQUEST_ID_1.to_owned(), events_sender_1);
+
+        let (events_sender_2, _) = mpsc::channel::<EventEntry>(CHANNEL_SIZE);
+        ci.events_senders_map
+            .senders_map
+            .lock()
+            .unwrap()
+            .insert(REQUEST_ID_2.to_owned(), events_sender_2);
+
+        assert_eq!(ci.events_senders_map.senders_map.lock().unwrap().len(), 2);
+
+        ci.remove_events_campaign(REQUEST_ID_1);
+
+        {
+            let map_guard = ci.events_senders_map.senders_map.lock().unwrap();
+            assert_eq!(map_guard.len(), 1);
+            assert!(map_guard.get(REQUEST_ID_1).is_none());
+            assert!(map_guard.get(REQUEST_ID_2).is_some());
+        }
+
+        ci.remove_events_campaign(REQUEST_ID_2);
+
+        {
+            let map_guard = ci.events_senders_map.senders_map.lock().unwrap();
+            assert_eq!(map_guard.len(), 0);
+            assert!(map_guard.get(REQUEST_ID_2).is_none());
+        }
+    }
+}

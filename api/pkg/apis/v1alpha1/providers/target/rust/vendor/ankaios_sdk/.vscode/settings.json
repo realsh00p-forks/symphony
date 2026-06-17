@@ -1,0 +1,37 @@
+{
+    "cSpell.words": [
+        "Ankaios",
+        "chrono",
+        "clippy",
+        "doctest",
+        "Elektrobit",
+        "IRWXU",
+        "itest",
+        "libankaios_sdk",
+        "mockall",
+        "mkfifo",
+        "msrv",
+        "nextest",
+        "oneshot",
+        "prost",
+        "proto",
+        "repr",
+        "rustup",
+        "serde",
+        "substate",
+        "thiserror",
+        "unistd",
+        "utest",
+        "varint",
+        "withf",
+    ],
+    "[rust]": {
+        "editor.defaultFormatter": "rust-lang.rust-analyzer",
+        "editor.formatOnSave": true
+    },
+    "rust-analyzer.check.command": "clippy",
+    "protobuf.diagnostics.namingConventions": false,
+    "protobuf.includes": [
+        "/workspaces/ank-rust/proto"
+    ]
+}

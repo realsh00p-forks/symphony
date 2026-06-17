@@ -4,7 +4,7 @@
  * SPDX-License-Identifier: MIT
  */
 
- #![cfg(all(unix))]
+#![cfg(all(unix))]
 
 use std::collections::HashMap;
 use std::ffi::{c_char, CStr};
@@ -79,7 +79,7 @@ impl AnkaiosProvider {
         let tokio_runtime = tokio::runtime::Runtime::new()?;
 
         let ankaios_client = tokio_runtime
-            .block_on(Ankaios::new_with_timeout(Duration::from_secs(5)))
+            .block_on(Ankaios::new_with_timeout(Duration::from_secs(30)))
             .inspect_err(|err| {
                 error!("Failed to initialize Ankaios: {err}");
             })
@@ -236,7 +236,10 @@ impl AnkaiosProvider {
         for component in step.components.iter() {
             if component.action == ComponentAction::Delete {
                 // Simulate deletion
-                match ankaios_client.delete_workload(component.component.name.clone()).await {
+                match ankaios_client
+                    .delete_workload(component.component.name.clone())
+                    .await
+                {
                     Ok(_) => {
                         let component_result = ComponentResultSpec {
                             status: State::OK,
@@ -337,6 +340,20 @@ impl ITargetProvider for AnkaiosProvider {
         }
 
         self.runtime.block_on(self.async_apply(deployment, step))
+    }
+
+    fn commit(&self, _deployment: DeploymentSpec) -> Result<(), String> {
+        self.runtime.block_on(async {
+            let mut ankaios_client = self.ank.lock().await;
+            ankaios_client
+                .commit_state()
+                .await
+                .map(|_| ())
+                .map_err(|err| {
+                    error!("Failed to commit Ankaios state: {err}");
+                    err.to_string()
+                })
+        })
     }
 }
 
