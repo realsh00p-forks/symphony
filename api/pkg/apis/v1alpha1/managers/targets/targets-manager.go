@@ -7,9 +7,12 @@
 package targets
 
 import (
-	"context"
+	stdctx "context"
 	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
 
 	"github.com/eclipse-symphony/symphony/api/constants"
 	"github.com/eclipse-symphony/symphony/api/pkg/apis/v1alpha1/model"
@@ -54,10 +57,67 @@ func (s *TargetsManager) Init(context *contexts.VendorContext, config managers.M
 		// s.TargetValidator = validation.NewTargetValidator(s.targetInstanceLookup, s.targetUniqueNameLookup)
 		s.TargetValidator = validation.NewTargetValidator(nil, s.targetUniqueNameLookup)
 	}
+	if err = s.loadStaticTargets(stdctx.Background(), config.Properties); err != nil {
+		return err
+	}
 	return nil
 }
 
-func (t *TargetsManager) DeleteSpec(ctx context.Context, name string, namespace string) error {
+func (t *TargetsManager) loadStaticTargets(ctx stdctx.Context, properties map[string]string) error {
+	targetFiles := make([]string, 0)
+	if raw := strings.TrimSpace(properties["staticTargets"]); raw != "" {
+		for _, part := range strings.Split(raw, ",") {
+			if path := strings.TrimSpace(part); path != "" {
+				targetFiles = append(targetFiles, path)
+			}
+		}
+	}
+	if raw := strings.TrimSpace(properties["staticTargetsDir"]); raw != "" {
+		entries, err := os.ReadDir(raw)
+		if err != nil {
+			return fmt.Errorf("failed to read static targets directory %q: %w", raw, err)
+		}
+		for _, entry := range entries {
+			if entry.IsDir() || filepath.Ext(entry.Name()) != ".json" {
+				continue
+			}
+			targetFiles = append(targetFiles, filepath.Join(raw, entry.Name()))
+		}
+	}
+	for _, path := range targetFiles {
+		if err := t.loadStaticTargetsFile(ctx, path); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (t *TargetsManager) loadStaticTargetsFile(ctx stdctx.Context, path string) error {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("failed to read static target file %q: %w", path, err)
+	}
+	targets := make([]model.TargetState, 0)
+	if err = json.Unmarshal(data, &targets); err != nil {
+		var target model.TargetState
+		if err = json.Unmarshal(data, &target); err != nil {
+			return fmt.Errorf("failed to parse static target file %q: %w", path, err)
+		}
+		targets = append(targets, target)
+	}
+	for _, target := range targets {
+		if target.ObjectMeta.Name == "" {
+			return fmt.Errorf("static target file %q contains a target without metadata.name", path)
+		}
+		if err = t.UpsertState(ctx, target.ObjectMeta.Name, target); err != nil {
+			return fmt.Errorf("failed to load static target %q from %q: %w", target.ObjectMeta.Name, path, err)
+		}
+		log.InfofCtx(ctx, " M (Targets): loaded static target %q from %s", target.ObjectMeta.Name, path)
+	}
+	return nil
+}
+
+func (t *TargetsManager) DeleteSpec(ctx stdctx.Context, name string, namespace string) error {
 	ctx, span := observability.StartSpan("Targets Manager", ctx, &map[string]string{
 		"method": "DeleteSpec",
 	})
@@ -84,7 +144,7 @@ func (t *TargetsManager) DeleteSpec(ctx context.Context, name string, namespace 
 	return err
 }
 
-func (t *TargetsManager) UpsertState(ctx context.Context, name string, state model.TargetState) error {
+func (t *TargetsManager) UpsertState(ctx stdctx.Context, name string, state model.TargetState) error {
 	ctx, span := observability.StartSpan("Targets Manager", ctx, &map[string]string{
 		"method": "UpsertSpec",
 	})
@@ -141,7 +201,7 @@ func (t *TargetsManager) UpsertState(ctx context.Context, name string, state mod
 }
 
 // Caller need to explicitly set namespace in current.Metadata!
-func (t *TargetsManager) ReportState(ctx context.Context, current model.TargetState) (model.TargetState, error) {
+func (t *TargetsManager) ReportState(ctx stdctx.Context, current model.TargetState) (model.TargetState, error) {
 	ctx, span := observability.StartSpan("Targets Manager", ctx, &map[string]string{
 		"method": "ReportState",
 	})
@@ -202,7 +262,7 @@ func (t *TargetsManager) ReportState(ctx context.Context, current model.TargetSt
 	}
 	return targetState, nil
 }
-func (t *TargetsManager) ListState(ctx context.Context, namespace string) ([]model.TargetState, error) {
+func (t *TargetsManager) ListState(ctx stdctx.Context, namespace string) ([]model.TargetState, error) {
 	ctx, span := observability.StartSpan("Targets Manager", ctx, &map[string]string{
 		"method": "ListSpec",
 	})
@@ -250,7 +310,7 @@ func getTargetState(body interface{}) (model.TargetState, error) {
 	return targetState, nil
 }
 
-func (t *TargetsManager) GetState(ctx context.Context, id string, namespace string) (model.TargetState, error) {
+func (t *TargetsManager) GetState(ctx stdctx.Context, id string, namespace string) (model.TargetState, error) {
 	ctx, span := observability.StartSpan("Targets Manager", ctx, &map[string]string{
 		"method": "GetSpec",
 	})
@@ -283,16 +343,16 @@ func (t *TargetsManager) GetState(ctx context.Context, id string, namespace stri
 	return ret, nil
 }
 
-func (t *TargetsManager) ValidateDelete(ctx context.Context, name string, namespace string) error {
+func (t *TargetsManager) ValidateDelete(ctx stdctx.Context, name string, namespace string) error {
 	state, err := t.GetState(ctx, name, namespace)
 	return validation.ValidateDeleteWrapper(ctx, &t.TargetValidator, state, err)
 }
 
-func (t *TargetsManager) targetUniqueNameLookup(ctx context.Context, displayName string, namespace string) (interface{}, error) {
+func (t *TargetsManager) targetUniqueNameLookup(ctx stdctx.Context, displayName string, namespace string) (interface{}, error) {
 	return states.GetObjectStateWithUniqueName(ctx, t.StateProvider, validation.Target, displayName, namespace)
 }
 
-func (t *TargetsManager) targetInstanceLookup(ctx context.Context, name string, namespace string) (bool, error) {
+func (t *TargetsManager) targetInstanceLookup(ctx stdctx.Context, name string, namespace string) (bool, error) {
 	instanceList, err := states.ListObjectStateWithLabels(ctx, t.StateProvider, validation.Instance, namespace, map[string]string{constants.Target: name}, 1)
 	if err != nil {
 		return false, err

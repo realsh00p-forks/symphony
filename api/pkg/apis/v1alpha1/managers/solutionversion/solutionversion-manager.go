@@ -11,6 +11,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"net/http"
+	"net/url"
 	"os"
 	"runtime/debug"
 	"strconv"
@@ -22,6 +25,7 @@ import (
 	sp "github.com/eclipse-symphony/symphony/api/pkg/apis/v1alpha1/providers"
 	tgt "github.com/eclipse-symphony/symphony/api/pkg/apis/v1alpha1/providers/target"
 	api_utils "github.com/eclipse-symphony/symphony/api/pkg/apis/v1alpha1/utils"
+	"github.com/eclipse-symphony/symphony/api/pkg/apis/v1alpha1/validation"
 	"github.com/eclipse-symphony/symphony/coa/pkg/apis/v1alpha2"
 	"github.com/eclipse-symphony/symphony/coa/pkg/apis/v1alpha2/contexts"
 	"github.com/eclipse-symphony/symphony/coa/pkg/apis/v1alpha2/managers"
@@ -31,6 +35,7 @@ import (
 	config "github.com/eclipse-symphony/symphony/coa/pkg/apis/v1alpha2/providers/config"
 	"github.com/eclipse-symphony/symphony/coa/pkg/apis/v1alpha2/providers/keylock"
 	secret "github.com/eclipse-symphony/symphony/coa/pkg/apis/v1alpha2/providers/secret"
+	state_utils "github.com/eclipse-symphony/symphony/coa/pkg/apis/v1alpha2/providers/states"
 	"github.com/eclipse-symphony/symphony/coa/pkg/logger"
 )
 
@@ -231,11 +236,18 @@ func (s *SolutionVersionManager) Reconcile(ctx context.Context, deployment model
 	}
 	summary := model.SummarySpec{
 		TargetResults:       make(map[string]model.TargetResultSpec),
-		TargetCount:         len(deployment.Targets),
+		TargetCount:         0,
 		SuccessCount:        0,
 		AllAssignedDeployed: false,
 		JobID:               deployment.JobID,
 	}
+	err = s.hydrateDeploymentTargetsFromRegistry(ctx, &deployment, namespace)
+	if err != nil {
+		summary.SummaryMessage = "failed to load deployment targets from registry: " + err.Error()
+		log.ErrorfCtx(ctx, " M (SolutionVersion): failed to load deployment targets from registry: %+v", err)
+		return summary, err
+	}
+	summary.TargetCount = len(deployment.Targets)
 
 	deploymentType := DeploymentType_Update
 	if remove {
@@ -771,6 +783,118 @@ func (s *SolutionVersionManager) Poll() []error {
 		}
 	}
 	return nil
+}
+
+func (s *SolutionVersionManager) hydrateDeploymentTargetsFromRegistry(ctx context.Context, deployment *model.DeploymentSpec, namespace string) error {
+	if deployment == nil || len(deployment.Targets) > 0 {
+		return nil
+	}
+
+	targetNames := make(map[string]struct{})
+	if deployment.Instance.Spec != nil {
+		if name := strings.TrimSpace(deployment.Instance.Spec.Target.Name); name != "" {
+			targetNames[name] = struct{}{}
+		}
+	}
+	if name := strings.TrimSpace(deployment.ActiveTarget); name != "" {
+		targetNames[name] = struct{}{}
+	}
+	for name := range deployment.Assignments {
+		if trimmed := strings.TrimSpace(name); trimmed != "" {
+			targetNames[trimmed] = struct{}{}
+		}
+	}
+	if len(targetNames) == 0 {
+		return nil
+	}
+
+	deployment.Targets = make(map[string]model.TargetState, len(targetNames))
+	for name := range targetNames {
+		body, err := state_utils.GetObjectState(ctx, s.StateProvider, validation.Target, name, namespace)
+		if err != nil {
+			targetState, apiErr := s.getTargetFromRegistryAPI(ctx, name, namespace)
+			if apiErr != nil {
+				return fmt.Errorf("target %q not found in registry: %w; api fallback failed: %v", name, err, apiErr)
+			}
+			if targetState.Spec == nil {
+				targetState.Spec = &model.TargetSpec{}
+			}
+			deployment.Targets[name] = targetState
+			continue
+		}
+
+		targetState, err := decodeTargetState(name, body)
+		if err != nil {
+			return err
+		}
+		deployment.Targets[name] = targetState
+	}
+
+	log.InfofCtx(ctx, " M (SolutionVersion): loaded %d deployment target(s) from registry", len(deployment.Targets))
+	return nil
+}
+
+func decodeTargetState(name string, body interface{}) (model.TargetState, error) {
+	var targetState model.TargetState
+	bytes, _ := json.Marshal(body)
+	if err := json.Unmarshal(bytes, &targetState); err != nil {
+		return model.TargetState{}, fmt.Errorf("target %q could not be decoded: %w", name, err)
+	}
+	if targetState.Spec == nil {
+		targetState.Spec = &model.TargetSpec{}
+	}
+	return targetState, nil
+
+}
+
+func (s *SolutionVersionManager) getTargetFromRegistryAPI(ctx context.Context, name string, namespace string) (model.TargetState, error) {
+	bases := make([]string, 0, 2)
+	if s.Context != nil {
+		baseURL := strings.TrimSpace(s.Context.SiteInfo.CurrentSite.BaseUrl)
+		if baseURL != "" {
+			bases = append(bases, baseURL)
+		}
+	}
+	bases = append(bases, "http://127.0.0.1:8082/v1alpha2/")
+
+	var lastErr error
+	for _, base := range bases {
+		endpoint := strings.TrimRight(base, "/") + "/targets/registry/" + url.PathEscape(name) + "?namespace=" + url.QueryEscape(namespace)
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		body, readErr := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if readErr != nil {
+			lastErr = readErr
+			continue
+		}
+		if resp.StatusCode >= http.StatusMultipleChoices {
+			lastErr = fmt.Errorf("GET %s returned %d: %s", endpoint, resp.StatusCode, strings.TrimSpace(string(body)))
+			continue
+		}
+
+		var targetState model.TargetState
+		if err = json.Unmarshal(body, &targetState); err != nil {
+			lastErr = err
+			continue
+		}
+		if targetState.Spec == nil {
+			targetState.Spec = &model.TargetSpec{}
+		}
+		return targetState, nil
+	}
+	if lastErr == nil {
+		lastErr = errors.New("no target registry endpoint configured")
+	}
+	return model.TargetState{}, lastErr
 }
 func (s *SolutionVersionManager) Reconcil() []error {
 	return nil
