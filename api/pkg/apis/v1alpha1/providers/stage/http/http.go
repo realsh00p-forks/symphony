@@ -43,6 +43,22 @@ var (
 	providerOperationMetrics *metrics.Metrics
 )
 
+var httpStageConfigKeys = map[string]struct{}{
+	"url":                 {},
+	"method":              {},
+	"successCodes":        {},
+	"wait.url":            {},
+	"wait.interval":       {},
+	"wait.count":          {},
+	"wait.start":          {},
+	"wait.success":        {},
+	"wait.fail":           {},
+	"wait.expression":     {},
+	"wait.expressionType": {},
+	"wait.body":           {},
+	"wait.bodyContains":   {},
+}
+
 type HttpStageProviderConfig struct {
 	Url                string `json:"url"`
 	Method             string `json:"method"`
@@ -55,6 +71,8 @@ type HttpStageProviderConfig struct {
 	WaitFailedCodes    []int  `json:"wait.fail,omitempty"`
 	WaitExpression     string `json:"wait.expression,omitempty"`
 	WaitExpressionType string `json:"wait.expressionType,omitempty"`
+	WaitBody           string `json:"wait.body,omitempty"`
+	WaitBodyContains   string `json:"wait.bodyContains,omitempty"`
 }
 type HttpStageProvider struct {
 	Config  HttpStageProviderConfig
@@ -166,6 +184,12 @@ func MockStageProviderConfigFromMap(properties map[string]string) (HttpStageProv
 	} else {
 		ret.WaitExpressionType = "symphony"
 	}
+	if v, ok := properties["wait.body"]; ok {
+		ret.WaitBody = v
+	}
+	if v, ok := properties["wait.bodyContains"]; ok {
+		ret.WaitBodyContains = v
+	}
 	return ret, nil
 }
 func readIntArray(s string) ([]int, error) {
@@ -206,9 +230,8 @@ func (i *HttpStageProvider) Process(ctx context.Context, mgrContext contexts.Man
 	var configMap map[string]interface{}
 	configJson, _ := json.Marshal(i.Config)
 	json.Unmarshal(configJson, &configMap)
-	for key := range configMap {
-		val, found := inputs[key]
-		if found {
+	for key, val := range inputs {
+		if _, found := httpStageConfigKeys[key]; found {
 			configMap[key] = val
 		}
 	}
@@ -361,16 +384,15 @@ func (i *HttpStageProvider) Process(ctx context.Context, mgrContext contexts.Man
 			waitResp, err = webClient.Do(waitReq)
 			if err != nil {
 				sLog.ErrorfCtx(ctx, "  P (Http Stage): wait request failed: %v", err)
-				providerOperationMetrics.ProviderOperationErrors(
-					httpProvider,
-					functionName,
-					metrics.ProcessOperation,
-					metrics.RunOperationType,
-					v1alpha2.HttpSendWaitRequestFailed.String(),
-				)
-				return nil, false, err
+				outputs["waitError"] = err.Error()
+				counter++
+				if i.Config.WaitInterval > 0 {
+					sLog.DebugCtx(ctx, "  P (Http Stage): sleep for wait interval")
+					time.Sleep(time.Duration(i.Config.WaitInterval) * time.Second)
+				}
+				continue
 			}
-			defer waitResp.Body.Close()
+			outputs["waitStatus"] = waitResp.StatusCode
 			if len(i.Config.WaitFailedCodes) > 0 {
 				for _, code := range i.Config.WaitFailedCodes {
 					if code == waitResp.StatusCode {
@@ -390,6 +412,7 @@ func (i *HttpStageProvider) Process(ctx context.Context, mgrContext contexts.Man
 			if succeeded {
 				var data []byte
 				data, err = io.ReadAll(waitResp.Body)
+				waitResp.Body.Close()
 				if err != nil {
 					sLog.ErrorfCtx(ctx, "  P (Http Stage): failed to read wait request response: %v", err)
 					providerOperationMetrics.ProviderOperationErrors(
@@ -401,6 +424,14 @@ func (i *HttpStageProvider) Process(ctx context.Context, mgrContext contexts.Man
 					)
 					succeeded = false
 				} else {
+					waitBody := string(data)
+					outputs["waitBody"] = waitBody
+					if i.Config.WaitBody != "" && waitBody != i.Config.WaitBody {
+						succeeded = false
+					}
+					if i.Config.WaitBodyContains != "" && !strings.Contains(waitBody, i.Config.WaitBodyContains) {
+						succeeded = false
+					}
 					if i.Config.WaitExpression != "" {
 						var obj interface{}
 						err = json.Unmarshal(data, &obj)
@@ -453,10 +484,9 @@ func (i *HttpStageProvider) Process(ctx context.Context, mgrContext contexts.Man
 							}
 						}
 					}
-					if succeeded {
-						outputs["waitBody"] = string(data) //TODO: probably not so good to assume string
-					}
 				}
+			} else {
+				waitResp.Body.Close()
 			}
 			if !failed && !succeeded {
 				counter++
@@ -477,6 +507,16 @@ func (i *HttpStageProvider) Process(ctx context.Context, mgrContext contexts.Man
 				v1alpha2.HttpBadWaitStatusCode.String(),
 			)
 			return nil, false, v1alpha2.NewCOAError(nil, fmt.Sprintf("failed to wait for operation %v", resp.StatusCode), v1alpha2.BadConfig)
+		}
+		if !succeeded {
+			providerOperationMetrics.ProviderOperationErrors(
+				httpProvider,
+				functionName,
+				metrics.ProcessOperation,
+				metrics.RunOperationType,
+				v1alpha2.HttpBadWaitStatusCode.String(),
+			)
+			return nil, false, v1alpha2.NewCOAError(nil, fmt.Sprintf("timed out waiting for %v", i.Config.WaitUrl), v1alpha2.BadConfig)
 		}
 
 	} else if len(i.Config.SuccessCodes) > 0 {

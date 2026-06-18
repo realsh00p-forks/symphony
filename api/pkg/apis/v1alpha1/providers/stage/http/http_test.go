@@ -9,6 +9,8 @@ package http
 import (
 	"context"
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"testing"
 
@@ -61,6 +63,140 @@ func TestHttpProcessOverrideConfig(t *testing.T) {
 	assert.Equal(t, []int{500}, provider.Config.WaitFailedCodes)
 	assert.Equal(t, []int{200}, provider.Config.WaitStartCodes)
 }
+
+func TestHttpWaitPlainBody(t *testing.T) {
+	var waitCalls int
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/start":
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("started"))
+		case "/health":
+			waitCalls++
+			w.WriteHeader(http.StatusOK)
+			if waitCalls < 3 {
+				_, _ = w.Write([]byte("starting"))
+				return
+			}
+			_, _ = w.Write([]byte("healthy"))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer ts.Close()
+
+	provider := HttpStageProvider{}
+	err := provider.Init(HttpStageProviderConfig{
+		Method:           "GET",
+		Url:              ts.URL + "/start",
+		WaitStartCodes:   []int{200},
+		WaitUrl:          ts.URL + "/health",
+		WaitSuccessCodes: []int{200},
+		WaitInterval:     0,
+		WaitCount:        5,
+		WaitBody:         "healthy",
+	})
+	assert.Nil(t, err)
+
+	outputs, _, err := provider.Process(context.Background(), contexts.ManagerContext{}, nil)
+	assert.Nil(t, err)
+	assert.NotNil(t, outputs)
+	assert.Equal(t, 200, outputs["status"])
+	assert.Equal(t, 200, outputs["waitStatus"])
+	assert.Equal(t, "healthy", outputs["waitBody"])
+	assert.Equal(t, 3, waitCalls)
+}
+
+func TestHttpWaitPlainBodyFromInputs(t *testing.T) {
+	var waitCalls int
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/start":
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("started"))
+		case "/health":
+			waitCalls++
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("healthy"))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer ts.Close()
+
+	provider := HttpStageProvider{}
+	err := provider.Init(HttpStageProviderConfig{})
+	assert.Nil(t, err)
+
+	outputs, _, err := provider.Process(context.Background(), contexts.ManagerContext{}, map[string]interface{}{
+		"method":       "GET",
+		"url":          ts.URL + "/start",
+		"wait.start":   []int{200},
+		"wait.url":     ts.URL + "/health",
+		"wait.success": []int{200},
+		"wait.count":   2,
+		"wait.body":    "healthy",
+	})
+	assert.Nil(t, err)
+	assert.NotNil(t, outputs)
+	assert.Equal(t, 200, outputs["status"])
+	assert.Equal(t, 200, outputs["waitStatus"])
+	assert.Equal(t, "healthy", outputs["waitBody"])
+	assert.Equal(t, 1, waitCalls)
+}
+
+func TestHttpWaitBodyTimeoutFails(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("starting"))
+	}))
+	defer ts.Close()
+
+	provider := HttpStageProvider{}
+	err := provider.Init(HttpStageProviderConfig{
+		Method:           "GET",
+		Url:              ts.URL,
+		WaitStartCodes:   []int{200},
+		WaitUrl:          ts.URL,
+		WaitSuccessCodes: []int{200},
+		WaitInterval:     0,
+		WaitCount:        2,
+		WaitBody:         "healthy",
+	})
+	assert.Nil(t, err)
+
+	outputs, _, err := provider.Process(context.Background(), contexts.ManagerContext{}, nil)
+	assert.NotNil(t, err)
+	assert.Nil(t, outputs)
+}
+
+func TestHttpWaitRequestErrorsAreRetried(t *testing.T) {
+	provider := HttpStageProvider{}
+	err := provider.Init(HttpStageProviderConfig{
+		Method:           "GET",
+		Url:              "http://127.0.0.1:1",
+		WaitStartCodes:   []int{200},
+		WaitUrl:          "http://127.0.0.1:1",
+		WaitSuccessCodes: []int{200},
+		WaitInterval:     0,
+		WaitCount:        2,
+		WaitBody:         "healthy",
+	})
+	assert.Nil(t, err)
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("started"))
+	}))
+	defer ts.Close()
+
+	outputs, _, err := provider.Process(context.Background(), contexts.ManagerContext{}, map[string]interface{}{
+		"url": ts.URL,
+	})
+	assert.NotNil(t, err)
+	assert.Nil(t, outputs)
+}
+
 func TestPingBing(t *testing.T) {
 	provider := HttpStageProvider{}
 	err := provider.Init(HttpStageProviderConfig{
@@ -117,9 +253,9 @@ func TestCallLogicApp(t *testing.T) {
 	outputs, _, err := provider.Process(context.Background(), contexts.ManagerContext{}, map[string]interface{}{
 		"body": map[string]interface{}{ // this is a sample request body
 			"solutionversion": "solutionversion1",
-			"instance": "instance1",
-			"target":   "target1",
-			"id":       "instance1-solutionversion1-target1",
+			"instance":        "instance1",
+			"target":          "target1",
+			"id":              "instance1-solutionversion1-target1",
 		},
 	})
 	assert.Nil(t, err)
