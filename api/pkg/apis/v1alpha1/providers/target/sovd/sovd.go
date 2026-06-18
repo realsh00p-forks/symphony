@@ -111,6 +111,13 @@ func (s *SOVDTargetProvider) GetValidationRule(ctx context.Context) model.Valida
 				"ankaios.restartPolicy",
 				"ankaios.dependencies",
 			},
+			ChangeDetectionProperties: []model.PropertyDesc{
+				{Name: "ankaios.agent", IgnoreCase: false, SkipIfMissing: false},
+				{Name: "ankaios.runtime", IgnoreCase: false, SkipIfMissing: false},
+				{Name: "ankaios.runtimeConfig", IgnoreCase: false, SkipIfMissing: false},
+				{Name: "ankaios.restartPolicy", IgnoreCase: false, SkipIfMissing: true},
+				{Name: "ankaios.dependencies", IgnoreCase: false, SkipIfMissing: true},
+			},
 			RequiredComponentType: "",
 			RequiredMetadata:      []string{},
 			OptionalMetadata:      []string{},
@@ -133,10 +140,7 @@ func (s *SOVDTargetProvider) Get(ctx context.Context, deployment model.Deploymen
 			continue
 		}
 		component := ref.Component
-		props := component.Properties
-		if props == nil {
-			props = map[string]interface{}{}
-		}
+		props := cloneProperties(component.Properties)
 		copyStringProperty(props, workload, "ankaios.agent", "agent")
 		copyStringProperty(props, workload, "ankaios.runtime", "runtime")
 		copyStringProperty(props, workload, "ankaios.restartPolicy", "restartPolicy")
@@ -145,6 +149,14 @@ func (s *SOVDTargetProvider) Get(ctx context.Context, deployment model.Deploymen
 		ret = append(ret, component)
 	}
 	return ret, nil
+}
+
+func cloneProperties(properties map[string]interface{}) map[string]interface{} {
+	props := make(map[string]interface{}, len(properties))
+	for k, v := range properties {
+		props[k] = v
+	}
+	return props
 }
 
 func (s *SOVDTargetProvider) Apply(ctx context.Context, deployment model.DeploymentSpec, step model.DeploymentStep, isDryRun bool) (map[string]model.ComponentResultSpec, error) {
