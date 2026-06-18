@@ -16,6 +16,8 @@ vendor/
 dist/
 bin/
 symphony-api
+symphony-api-linux-arm64
+symphony-api-linux-arm64-glibc231
 symphony-agent
 symphony-api-mac
 symphony-api.exe
